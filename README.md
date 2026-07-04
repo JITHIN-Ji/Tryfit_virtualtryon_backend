@@ -1,1 +1,0 @@
-# swakriti-virtual-tryon
