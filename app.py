@@ -7,12 +7,12 @@ import logging
 import typing
 import threading
 import time
-import concurrent.futures
 from io import BytesIO
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock, Thread
-from datetime import datetime
+# from threading import Lock, Thread          # only needed by the 360 spin section (commented out below)
+# from datetime import datetime                # only needed by the 360 spin section (commented out below)
+# import concurrent.futures                    # only needed by the 360 spin section (commented out below)
 
 from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
@@ -31,9 +31,9 @@ from google.genai.types import (
 )
 from google.oauth2 import service_account
 
-# Gemini API (360 spin) SDK surface — same `google.genai` package, different client
-from google import genai as gemini_genai
-from google.genai import types as gemini_types
+# Gemini API (360 spin) SDK surface — only used by the commented-out section below
+# from google import genai as gemini_genai
+# from google.genai import types as gemini_types
 
 # Load environment variables
 load_dotenv()
@@ -65,6 +65,41 @@ CORS(app,
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 VALID_CATEGORIES = ['upper_body', 'lower_body', 'dresses']
+
+# ─────────────────────────────────────────────────────────
+# Shared-secret API key auth — protects /try-on* only.
+# No login system exists, so this isn't per-user auth — it just proves
+# the caller is our app (or holds our key), not a random script.
+# ─────────────────────────────────────────────────────────
+APP_API_KEY = os.getenv("APP_API_KEY", "")
+
+if not APP_API_KEY:
+    logger.error("APP_API_KEY not set — /try-on endpoints will reject all requests")
+
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not APP_API_KEY:
+            return jsonify({
+                'success': False,
+                'error': 'Server misconfigured',
+                'message': 'Authentication is not configured'
+            }), 503
+
+        auth_header = request.headers.get('Authorization', '')
+        expected = f'Bearer {APP_API_KEY}'
+
+        if auth_header != expected:
+            return jsonify({
+                'success': False,
+                'error': 'Unauthorized',
+                'message': 'Missing or invalid Authorization header'
+            }), 401
+
+        return f(*args, **kwargs)
+    return decorated_function
+
 
 # ═══════════════════════════════════════════════════════════════
 # SECTION 1 — Virtual Try-On service (Vertex AI)
@@ -240,6 +275,7 @@ tryon_bp = Blueprint('tryon', __name__)
 
 @tryon_bp.route('/try-on', methods=['POST'])
 @require_tryon_client
+@require_api_key
 def virtual_try_on():
     person_path = None
     clothing_path = None
@@ -319,6 +355,7 @@ def virtual_try_on():
 
 
 @tryon_bp.route('/try-on/status/<request_id>', methods=['GET'])
+@require_api_key
 def try_on_status(request_id):
     with processing_lock:
         if request_id not in processing_results:
@@ -340,329 +377,339 @@ def try_on_status(request_id):
         }), 202
 
     if result.get('status') == 'completed':
-        with processing_lock:
-            processing_results.pop(request_id, None)
-        return jsonify(result), 200
+    
+        def delayed_cleanup():
+            time.sleep(300)
+            with processing_lock:
+                processing_results.pop(request_id, None)
+                logger.info(f"Cleaned up completed request: {request_id}")
+        
+        cleanup_thread = threading.Thread(target=delayed_cleanup, daemon=True)
+        cleanup_thread.start()
+        
+        return jsonify(result), 200  
 
     if result.get('status') == 'failed':
-        with processing_lock:
-            processing_results.pop(request_id, None)
-        return jsonify(result), 500
+        return jsonify(result), 500   
 
     return jsonify({'success': False, 'error': 'Unknown status', 'message': 'The request status is unknown'}), 500
 
 
 # ═══════════════════════════════════════════════════════════════
-# SECTION 2 — 360° Spin service (Gemini API)
+# SECTION 2 — 360° Spin service (Gemini API) — COMMENTED OUT
+#
+# Disabled per request. Nothing deleted — uncomment this whole block
+# (and its matching imports near the top of the file, and the
+# `app.register_blueprint(spin_bp)` line further down) to restore it.
 # ═══════════════════════════════════════════════════════════════
 
-spin_job_store = {}
-spin_job_store_lock = Lock()
-
-_gemini_client = None
-
-
-def get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment variables")
-        _gemini_client = gemini_genai.Client(api_key=api_key)
-        logger.info("✅ 360° Spin (Gemini) client initialized successfully")
-    return _gemini_client
-
-
-def encode_image_to_base64(image_data):
-    if isinstance(image_data, bytes):
-        return base64.b64encode(image_data).decode()
-    buffer = BytesIO()
-    image_data.save(buffer, format='JPEG')
-    return base64.b64encode(buffer.getvalue()).decode()
-
-
-def generate_angle_image(client, image_data, angle_prompt, suffix, back_garment_image=None):
-    model = "gemini-3.1-flash-image-preview"
-
-    base64_image = encode_image_to_base64(image_data)
-
-    content_parts = [
-        gemini_types.Part.from_bytes(
-            mime_type="image/jpeg",
-            data=base64.b64decode(base64_image)
-        )
-    ]
-
-    if back_garment_image is not None and "back view" in angle_prompt.lower():
-        back_garment_base64 = encode_image_to_base64(back_garment_image)
-        content_parts.append(
-            gemini_types.Part.from_bytes(
-                mime_type="image/jpeg",
-                data=base64.b64decode(back_garment_base64)
-            )
-        )
-
-    content_parts.append(gemini_types.Part.from_text(text=angle_prompt))
-
-    contents = [gemini_types.Content(role="user", parts=content_parts)]
-
-    config = gemini_types.GenerateContentConfig(
-        response_modalities=["image", "text"],
-        safety_settings=[
-            gemini_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_LOW_AND_ABOVE"),
-            gemini_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_LOW_AND_ABOVE"),
-            gemini_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_LOW_AND_ABOVE"),
-            gemini_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_LOW_AND_ABOVE")
-        ],
-        response_mime_type="text/plain",
-    )
-
-    try:
-        for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
-            if chunk.candidates and chunk.candidates[0].content.parts:
-                for part in chunk.candidates[0].content.parts:
-                    if part.inline_data:
-                        return part.inline_data.data
-        return None
-    except Exception as e:
-        logger.error(f"Error generating angle image: {e}")
-        return None
-
-
-def generate_single_angle(args):
-    client, image_bytes, angle, description, index, back_garment_bytes = args
-
-    angle_prompt = f"""Generate {description} of the same person wearing identical clothing.
-
-CRITICAL REQUIREMENTS:
-1. BACKGROUND: Maintain the EXACT SAME background from the original image. The background color, lighting, shadows, and environment MUST remain completely identical across all angles. This is STRICT and NON-NEGOTIABLE.
-2. PERSON: Keep the exact same person appearance, face, body proportions, height, and features.
-3. CLOTHING: Maintain identical clothing fit, colors, patterns, fabric texture, and draping style.
-4. LIGHTING: Keep the same lighting direction, intensity, and shadows as the original image.
-5. PERSPECTIVE: Show {angle}° rotation perspective while keeping everything else constant.
-
-The only change should be the rotation angle. Everything else including background MUST stay identical to the source image."""
-
-    garment_ref = back_garment_bytes if "back view" in description else None
-
-    image_data = generate_angle_image(
-        client,
-        image_bytes,
-        angle_prompt,
-        f"{index:02d}_{angle:03.0f}deg",
-        back_garment_image=garment_ref
-    )
-
-    if image_data:
-        return {
-            'angle': angle,
-            'description': description,
-            'image_data': base64.b64encode(image_data).decode(),
-            'index': index
-        }
-    return None
-
-
-def update_spin_job_status(request_id, status, message=None, progress=None, result=None, error=None):
-    with spin_job_store_lock:
-        if request_id in spin_job_store:
-            spin_job_store[request_id]['status'] = status
-            spin_job_store[request_id]['updated_at'] = datetime.now()
-
-            if message:
-                spin_job_store[request_id]['message'] = message
-            if progress is not None:
-                spin_job_store[request_id]['progress'] = progress
-            if result is not None:
-                spin_job_store[request_id]['result'] = result
-            if error is not None:
-                spin_job_store[request_id]['error'] = error
-
-
-def process_360_generation_async(request_id, image_bytes, back_garment_bytes, num_angles):
-    try:
-        logger.info(f"🔄 Starting async 360° generation for request: {request_id}")
-        update_spin_job_status(request_id, 'processing', 'Preparing images...', 0)
-
-        angles = [i * (360 / num_angles) for i in range(num_angles)]
-        angle_descriptions = [
-            "front view",
-            "front-right diagonal view",
-            "right side view",
-            "back-right diagonal view",
-            "back view",
-            "back-left diagonal view",
-            "left side view",
-            "front-left diagonal view"
-        ]
-
-        client = get_gemini_client()
-
-        tasks = [
-            (client, image_bytes, angle, desc, i, back_garment_bytes)
-            for i, (angle, desc) in enumerate(zip(angles, angle_descriptions))
-        ]
-
-        generated_images = []
-        completed = 0
-
-        update_spin_job_status(request_id, 'processing', 'Generating angles...', 10)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as spin_executor:
-            futures = {spin_executor.submit(generate_single_angle, task): i for i, task in enumerate(tasks)}
-
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result:
-                    generated_images.append(result)
-                    completed += 1
-
-                    progress = 10 + int((completed / len(tasks)) * 85)
-                    update_spin_job_status(
-                        request_id,
-                        'processing',
-                        f'Generated {completed}/{len(tasks)} angles...',
-                        progress
-                    )
-                    logger.info(f"✅ Generated angle {completed}/{len(tasks)} for request {request_id}")
-
-        generated_images.sort(key=lambda x: x['index'])
-
-        if not generated_images:
-            update_spin_job_status(request_id, 'failed', error='Failed to generate any images')
-            logger.error(f"❌ No images generated for request {request_id}")
-            return
-
-        result = {
-            'success': True,
-            'images': generated_images,
-            'total_angles': len(generated_images)
-        }
-
-        update_spin_job_status(request_id, 'completed', 'Generation complete!', 100, result=result)
-        logger.info(f"✅ 360° generation completed successfully for request {request_id}")
-
-    except Exception as e:
-        logger.error(f"❌ Error in async 360° generation for request {request_id}: {e}")
-        update_spin_job_status(request_id, 'failed', error=str(e))
-
-
-def cleanup_old_spin_jobs():
-    """Remove 360° jobs older than 1 hour"""
-    with spin_job_store_lock:
-        now = datetime.now()
-        to_remove = []
-        for req_id, job in spin_job_store.items():
-            age = (now - job['updated_at']).total_seconds()
-            if age > 3600:
-                to_remove.append(req_id)
-
-        for req_id in to_remove:
-            del spin_job_store[req_id]
-            logger.info(f"🧹 Cleaned up old 360° job: {req_id}")
-
-
-spin_bp = Blueprint('spin360', __name__)
-
-
-@spin_bp.route('/generate-360', methods=['POST'])
-def generate_360():
-    """
-    Generate 360° spin images (async with polling)
-    Expected form data:
-    - person_image: The try-on result image (required)
-    - back_garment_image: Back view reference (optional)
-    - num_angles: Number of angles to generate (default: 8)
-
-    Returns: 202 with request_id for polling
-    """
-    try:
-        if 'person_image' not in request.files:
-            return jsonify({'error': 'person_image is required'}), 400
-
-        person_file = request.files['person_image']
-        back_garment_file = request.files.get('back_garment_image')
-        num_angles = int(request.form.get('num_angles', 8))
-
-        request_id = str(uuid.uuid4())
-
-        person_image = PIL_Image.open(person_file)
-        img_buffer = BytesIO()
-        person_image.save(img_buffer, format='JPEG')
-        image_bytes = img_buffer.getvalue()
-
-        back_garment_bytes = None
-        if back_garment_file:
-            back_garment_pil = PIL_Image.open(back_garment_file)
-            back_garment_buffer = BytesIO()
-            back_garment_pil.save(back_garment_buffer, format='JPEG')
-            back_garment_bytes = back_garment_buffer.getvalue()
-
-        with spin_job_store_lock:
-            spin_job_store[request_id] = {
-                'status': 'queued',
-                'message': 'Request queued for processing',
-                'progress': 0,
-                'created_at': datetime.now(),
-                'updated_at': datetime.now(),
-                'result': None,
-                'error': None
-            }
-
-        thread = Thread(
-            target=process_360_generation_async,
-            args=(request_id, image_bytes, back_garment_bytes, num_angles)
-        )
-        thread.daemon = True
-        thread.start()
-
-        logger.info(f"✅ 360° generation request accepted: {request_id}")
-
-        return jsonify({
-            'request_id': request_id,
-            'message': '360° generation started. Use /status/{request_id} to check progress.'
-        }), 202
-
-    except Exception as e:
-        logger.error(f"Error in generate_360: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@spin_bp.route('/status/<request_id>', methods=['GET'])
-def check_spin_status(request_id):
-    """
-    Check the status of a 360° generation request
-    Returns:
-    - 202: Still processing
-    - 200: Completed successfully
-    - 404: Request not found
-    - 500: Processing failed
-    """
-    with spin_job_store_lock:
-        if request_id not in spin_job_store:
-            return jsonify({'error': 'Request not found'}), 404
-
-        job = spin_job_store[request_id]
-
-        if job['status'] in ['queued', 'processing']:
-            return jsonify({
-                'status': job['status'],
-                'message': job['message'],
-                'progress': job['progress'],
-                'request_id': request_id
-            }), 202
-
-        if job['status'] == 'completed':
-            result = job['result']
-            del spin_job_store[request_id]
-            return jsonify(result), 200
-
-        if job['status'] == 'failed':
-            error_msg = job.get('error', 'Unknown error occurred')
-            del spin_job_store[request_id]
-            return jsonify({'error': error_msg}), 500
-
-        return jsonify({'error': 'Unknown job status'}), 500
+# spin_job_store = {}
+# spin_job_store_lock = Lock()
+#
+# _gemini_client = None
+#
+#
+# def get_gemini_client():
+#     global _gemini_client
+#     if _gemini_client is None:
+#         api_key = os.getenv("GEMINI_API_KEY")
+#         if not api_key:
+#             raise ValueError("GEMINI_API_KEY not found in environment variables")
+#         _gemini_client = gemini_genai.Client(api_key=api_key)
+#         logger.info("✅ 360° Spin (Gemini) client initialized successfully")
+#     return _gemini_client
+#
+#
+# def encode_image_to_base64(image_data):
+#     if isinstance(image_data, bytes):
+#         return base64.b64encode(image_data).decode()
+#     buffer = BytesIO()
+#     image_data.save(buffer, format='JPEG')
+#     return base64.b64encode(buffer.getvalue()).decode()
+#
+#
+# def generate_angle_image(client, image_data, angle_prompt, suffix, back_garment_image=None):
+#     model = "gemini-3.1-flash-image-preview"
+#
+#     base64_image = encode_image_to_base64(image_data)
+#
+#     content_parts = [
+#         gemini_types.Part.from_bytes(
+#             mime_type="image/jpeg",
+#             data=base64.b64decode(base64_image)
+#         )
+#     ]
+#
+#     if back_garment_image is not None and "back view" in angle_prompt.lower():
+#         back_garment_base64 = encode_image_to_base64(back_garment_image)
+#         content_parts.append(
+#             gemini_types.Part.from_bytes(
+#                 mime_type="image/jpeg",
+#                 data=base64.b64decode(back_garment_base64)
+#             )
+#         )
+#
+#     content_parts.append(gemini_types.Part.from_text(text=angle_prompt))
+#
+#     contents = [gemini_types.Content(role="user", parts=content_parts)]
+#
+#     config = gemini_types.GenerateContentConfig(
+#         response_modalities=["image", "text"],
+#         safety_settings=[
+#             gemini_types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_LOW_AND_ABOVE"),
+#             gemini_types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_LOW_AND_ABOVE"),
+#             gemini_types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_LOW_AND_ABOVE"),
+#             gemini_types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_LOW_AND_ABOVE")
+#         ],
+#         response_mime_type="text/plain",
+#     )
+#
+#     try:
+#         for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+#             if chunk.candidates and chunk.candidates[0].content.parts:
+#                 for part in chunk.candidates[0].content.parts:
+#                     if part.inline_data:
+#                         return part.inline_data.data
+#         return None
+#     except Exception as e:
+#         logger.error(f"Error generating angle image: {e}")
+#         return None
+#
+#
+# def generate_single_angle(args):
+#     client, image_bytes, angle, description, index, back_garment_bytes = args
+#
+#     angle_prompt = f"""Generate {description} of the same person wearing identical clothing.
+#
+# CRITICAL REQUIREMENTS:
+# 1. BACKGROUND: Maintain the EXACT SAME background from the original image. The background color, lighting, shadows, and environment MUST remain completely identical across all angles. This is STRICT and NON-NEGOTIABLE.
+# 2. PERSON: Keep the exact same person appearance, face, body proportions, height, and features.
+# 3. CLOTHING: Maintain identical clothing fit, colors, patterns, fabric texture, and draping style.
+# 4. LIGHTING: Keep the same lighting direction, intensity, and shadows as the original image.
+# 5. PERSPECTIVE: Show {angle}° rotation perspective while keeping everything else constant.
+#
+# The only change should be the rotation angle. Everything else including background MUST stay identical to the source image."""
+#
+#     garment_ref = back_garment_bytes if "back view" in description else None
+#
+#     image_data = generate_angle_image(
+#         client,
+#         image_bytes,
+#         angle_prompt,
+#         f"{index:02d}_{angle:03.0f}deg",
+#         back_garment_image=garment_ref
+#     )
+#
+#     if image_data:
+#         return {
+#             'angle': angle,
+#             'description': description,
+#             'image_data': base64.b64encode(image_data).decode(),
+#             'index': index
+#         }
+#     return None
+#
+#
+# def update_spin_job_status(request_id, status, message=None, progress=None, result=None, error=None):
+#     with spin_job_store_lock:
+#         if request_id in spin_job_store:
+#             spin_job_store[request_id]['status'] = status
+#             spin_job_store[request_id]['updated_at'] = datetime.now()
+#
+#             if message:
+#                 spin_job_store[request_id]['message'] = message
+#             if progress is not None:
+#                 spin_job_store[request_id]['progress'] = progress
+#             if result is not None:
+#                 spin_job_store[request_id]['result'] = result
+#             if error is not None:
+#                 spin_job_store[request_id]['error'] = error
+#
+#
+# def process_360_generation_async(request_id, image_bytes, back_garment_bytes, num_angles):
+#     try:
+#         logger.info(f"🔄 Starting async 360° generation for request: {request_id}")
+#         update_spin_job_status(request_id, 'processing', 'Preparing images...', 0)
+#
+#         angles = [i * (360 / num_angles) for i in range(num_angles)]
+#         angle_descriptions = [
+#             "front view",
+#             "front-right diagonal view",
+#             "right side view",
+#             "back-right diagonal view",
+#             "back view",
+#             "back-left diagonal view",
+#             "left side view",
+#             "front-left diagonal view"
+#         ]
+#
+#         client = get_gemini_client()
+#
+#         tasks = [
+#             (client, image_bytes, angle, desc, i, back_garment_bytes)
+#             for i, (angle, desc) in enumerate(zip(angles, angle_descriptions))
+#         ]
+#
+#         generated_images = []
+#         completed = 0
+#
+#         update_spin_job_status(request_id, 'processing', 'Generating angles...', 10)
+#
+#         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as spin_executor:
+#             futures = {spin_executor.submit(generate_single_angle, task): i for i, task in enumerate(tasks)}
+#
+#             for future in concurrent.futures.as_completed(futures):
+#                 result = future.result()
+#                 if result:
+#                     generated_images.append(result)
+#                     completed += 1
+#
+#                     progress = 10 + int((completed / len(tasks)) * 85)
+#                     update_spin_job_status(
+#                         request_id,
+#                         'processing',
+#                         f'Generated {completed}/{len(tasks)} angles...',
+#                         progress
+#                     )
+#                     logger.info(f"✅ Generated angle {completed}/{len(tasks)} for request {request_id}")
+#
+#         generated_images.sort(key=lambda x: x['index'])
+#
+#         if not generated_images:
+#             update_spin_job_status(request_id, 'failed', error='Failed to generate any images')
+#             logger.error(f"❌ No images generated for request {request_id}")
+#             return
+#
+#         result = {
+#             'success': True,
+#             'images': generated_images,
+#             'total_angles': len(generated_images)
+#         }
+#
+#         update_spin_job_status(request_id, 'completed', 'Generation complete!', 100, result=result)
+#         logger.info(f"✅ 360° generation completed successfully for request {request_id}")
+#
+#     except Exception as e:
+#         logger.error(f"❌ Error in async 360° generation for request {request_id}: {e}")
+#         update_spin_job_status(request_id, 'failed', error=str(e))
+#
+#
+# def cleanup_old_spin_jobs():
+#     """Remove 360° jobs older than 1 hour"""
+#     with spin_job_store_lock:
+#         now = datetime.now()
+#         to_remove = []
+#         for req_id, job in spin_job_store.items():
+#             age = (now - job['updated_at']).total_seconds()
+#             if age > 3600:
+#                 to_remove.append(req_id)
+#
+#         for req_id in to_remove:
+#             del spin_job_store[req_id]
+#             logger.info(f"🧹 Cleaned up old 360° job: {req_id}")
+#
+#
+# spin_bp = Blueprint('spin360', __name__)
+#
+#
+# @spin_bp.route('/generate-360', methods=['POST'])
+# def generate_360():
+#     """
+#     Generate 360° spin images (async with polling)
+#     Expected form data:
+#     - person_image: The try-on result image (required)
+#     - back_garment_image: Back view reference (optional)
+#     - num_angles: Number of angles to generate (default: 8)
+#
+#     Returns: 202 with request_id for polling
+#     """
+#     try:
+#         if 'person_image' not in request.files:
+#             return jsonify({'error': 'person_image is required'}), 400
+#
+#         person_file = request.files['person_image']
+#         back_garment_file = request.files.get('back_garment_image')
+#         num_angles = int(request.form.get('num_angles', 8))
+#
+#         request_id = str(uuid.uuid4())
+#
+#         person_image = PIL_Image.open(person_file)
+#         img_buffer = BytesIO()
+#         person_image.save(img_buffer, format='JPEG')
+#         image_bytes = img_buffer.getvalue()
+#
+#         back_garment_bytes = None
+#         if back_garment_file:
+#             back_garment_pil = PIL_Image.open(back_garment_file)
+#             back_garment_buffer = BytesIO()
+#             back_garment_pil.save(back_garment_buffer, format='JPEG')
+#             back_garment_bytes = back_garment_buffer.getvalue()
+#
+#         with spin_job_store_lock:
+#             spin_job_store[request_id] = {
+#                 'status': 'queued',
+#                 'message': 'Request queued for processing',
+#                 'progress': 0,
+#                 'created_at': datetime.now(),
+#                 'updated_at': datetime.now(),
+#                 'result': None,
+#                 'error': None
+#             }
+#
+#         thread = Thread(
+#             target=process_360_generation_async,
+#             args=(request_id, image_bytes, back_garment_bytes, num_angles)
+#         )
+#         thread.daemon = True
+#         thread.start()
+#
+#         logger.info(f"✅ 360° generation request accepted: {request_id}")
+#
+#         return jsonify({
+#             'request_id': request_id,
+#             'message': '360° generation started. Use /status/{request_id} to check progress.'
+#         }), 202
+#
+#     except Exception as e:
+#         logger.error(f"Error in generate_360: {e}")
+#         return jsonify({'error': str(e)}), 500
+#
+#
+# @spin_bp.route('/status/<request_id>', methods=['GET'])
+# def check_spin_status(request_id):
+#     """
+#     Check the status of a 360° generation request
+#     Returns:
+#     - 202: Still processing
+#     - 200: Completed successfully
+#     - 404: Request not found
+#     - 500: Processing failed
+#     """
+#     with spin_job_store_lock:
+#         if request_id not in spin_job_store:
+#             return jsonify({'error': 'Request not found'}), 404
+#
+#         job = spin_job_store[request_id]
+#
+#         if job['status'] in ['queued', 'processing']:
+#             return jsonify({
+#                 'status': job['status'],
+#                 'message': job['message'],
+#                 'progress': job['progress'],
+#                 'request_id': request_id
+#             }), 202
+#
+#         if job['status'] == 'completed':
+#             result = job['result']
+#             del spin_job_store[request_id]
+#             return jsonify(result), 200
+#
+#         if job['status'] == 'failed':
+#             error_msg = job.get('error', 'Unknown error occurred')
+#             del spin_job_store[request_id]
+#             return jsonify({'error': error_msg}), 500
+#
+#         return jsonify({'error': 'Unknown job status'}), 500
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -670,7 +717,7 @@ def check_spin_status(request_id):
 # ═══════════════════════════════════════════════════════════════
 
 app.register_blueprint(tryon_bp)
-app.register_blueprint(spin_bp)
+# app.register_blueprint(spin_bp)   # disabled — 360 spin commented out
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -699,18 +746,18 @@ def handle_method_not_allowed(e):
 def home():
     """Combined API documentation endpoint"""
     return jsonify({
-        'message': 'TryFit API — Virtual Try-On + 360° Studio Spin',
+        'message': 'TryFit API — Virtual Try-On',
         'version': '2.0.0',
         'status': {
             'try_on': 'healthy' if tryon_client else 'unhealthy',
-            'spin_360': 'healthy' if os.getenv('GEMINI_API_KEY') else 'unhealthy',
+            # 'spin_360': 'healthy' if os.getenv('GEMINI_API_KEY') else 'unhealthy',  # disabled — 360 spin commented out
         },
         'endpoints': {
             '/': {'method': 'GET', 'description': 'API documentation and status'},
-            '/health': {'method': 'GET', 'description': 'Check combined API health status'},
+            '/health': {'method': 'GET', 'description': 'Check API health status'},
             '/try-on': {
                 'method': 'POST',
-                'description': 'Upload person and clothing images for virtual try-on',
+                'description': 'Upload person and clothing images for virtual try-on (requires Bearer API key)',
                 'parameters': {
                     'person_image': 'Image file of person (required)',
                     'clothing_image': 'Image file of clothing (required)',
@@ -720,31 +767,23 @@ def home():
                 'accepted_formats': list(ALLOWED_EXTENSIONS),
                 'max_file_size': '16MB'
             },
-            '/try-on/status/<request_id>': {'method': 'GET', 'description': 'Poll virtual try-on result'},
-            '/generate-360': {
-                'method': 'POST',
-                'description': 'Generate a 360° rotation spin from a try-on result image',
-                'parameters': {
-                    'person_image': 'Try-on result image (required)',
-                    'back_garment_image': 'Back-view reference (optional)',
-                    'num_angles': 'Number of angles to generate, default 8 (optional)'
-                }
-            },
-            '/status/<request_id>': {'method': 'GET', 'description': 'Poll 360° spin result'},
+            '/try-on/status/<request_id>': {'method': 'GET', 'description': 'Poll virtual try-on result (requires Bearer API key)'},
+            # '/generate-360': {...},        # disabled — 360 spin commented out
+            # '/status/<request_id>': {...}, # disabled — 360 spin commented out
         },
         'models': {
             'try_on': 'virtual-try-on-001',
-            'spin_360': 'gemini-3.1-flash-image-preview',
+            # 'spin_360': 'gemini-3.1-flash-image-preview',  # disabled — 360 spin commented out
         }
     })
 
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Combined health check for both services"""
+    """Health check"""
     tryon_healthy = bool(tryon_client)
-    spin_healthy = bool(os.getenv('GEMINI_API_KEY'))
-    overall_healthy = tryon_healthy and spin_healthy
+    # spin_healthy = bool(os.getenv('GEMINI_API_KEY'))   # disabled — 360 spin commented out
+    overall_healthy = tryon_healthy  # and spin_healthy
 
     return jsonify({
         'status': 'healthy' if overall_healthy else 'degraded',
@@ -753,10 +792,7 @@ def health_check():
                 'status': 'healthy' if tryon_healthy else 'unhealthy',
                 'message': 'Try-On client initialized' if tryon_healthy else 'Vertex AI client not initialized',
             },
-            'spin_360': {
-                'status': 'healthy' if spin_healthy else 'unhealthy',
-                'message': 'GEMINI_API_KEY present' if spin_healthy else 'GEMINI_API_KEY missing',
-            },
+            # 'spin_360': {...},  # disabled — 360 spin commented out
         },
         'timestamp': str(int(time.time())),
         'version': '2.0.0'
@@ -768,24 +804,24 @@ def favicon():
     return '', 204
 
 
-def periodic_cleanup():
-    """Background loop clearing stale 360° jobs (try-on results are popped on read)"""
-    while True:
-        time.sleep(600)  # every 10 minutes
-        cleanup_old_spin_jobs()
+# Re-enable this to restore the 360 spin cleanup loop:
+# def periodic_cleanup():
+#     """Background loop clearing stale 360° jobs (try-on results are popped on read)"""
+#     while True:
+#         time.sleep(600)  # every 10 minutes
+#         cleanup_old_spin_jobs()
 
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     debug = os.getenv('FLASK_ENV') == 'development'
 
-    # Start the 360° job-cleanup loop alongside the main server so both
-    # services come up together on a single `python app.py`
-    cleanup_thread = Thread(target=periodic_cleanup, daemon=True)
-    cleanup_thread.start()
+    # Re-enable this to restore the 360 spin cleanup loop alongside the server:
+    # cleanup_thread = Thread(target=periodic_cleanup, daemon=True)
+    # cleanup_thread.start()
 
     if not debug:
-        logger.info("Starting production server (try-on + 360° spin)...")
+        logger.info("Starting production server (try-on)...")
 
     app.run(
         host='0.0.0.0',
